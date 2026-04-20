@@ -237,7 +237,8 @@ class RealisticDispatchSimulator:
                     if np.any(valid):
                         k = idx_pos[valid]
                         hr = headroom[valid]
-                        share = hr / row_sum[valid].reshape(-1, 1)
+                        denom = row_sum[valid].reshape(-1, 1)
+                        share = np.divide(hr, denom, out=np.zeros_like(hr), where=denom > 1e-12)
                         P_t[k] += mismatch[k].reshape(-1, 1) * share
 
                 idx_neg = idx[mismatch[idx] < 0]
@@ -249,7 +250,8 @@ class RealisticDispatchSimulator:
                     if np.any(valid):
                         k = idx_neg[valid]
                         fr = footroom[valid]
-                        share = fr / row_sum[valid].reshape(-1, 1)
+                        denom = row_sum[valid].reshape(-1, 1)
+                        share = np.divide(fr, denom, out=np.zeros_like(fr), where=denom > 1e-12)
                         P_t[k] += mismatch[k].reshape(-1, 1) * share
 
                 P_t = np.nan_to_num(P_t, nan=0.0, posinf=float(np.max(self.Pmax)), neginf=0.0)
