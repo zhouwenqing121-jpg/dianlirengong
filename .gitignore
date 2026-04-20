@@ -2,3 +2,5 @@ ppt_figures/
 summary.png
 __pycache__/
 *.pyc
+ppt_figures_aligned/
+ppt_figures_realistic/
