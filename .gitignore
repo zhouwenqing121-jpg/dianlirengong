@@ -1,2 +1,4 @@
 ppt_figures/
 summary.png
+__pycache__/
+*.pyc

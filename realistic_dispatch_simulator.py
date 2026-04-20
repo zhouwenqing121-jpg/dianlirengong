@@ -86,11 +86,14 @@ class RealisticDispatchSimulator:
         l += P @ self.B0 + self.B00
         return l
 
-    def gen_cost(self, P):
-        base = self.a + self.b * P + self.c * (P ** 2)
+    def gen_cost(self, P, u=None):
+        if u is None:
+            u = np.ones_like(P, dtype=float)
+        u = u.astype(float)
+        base = u * (self.a + self.b * P + self.c * (P ** 2))
         if not self.use_valve_point:
             return np.sum(base, axis=1)
-        vpe = np.abs(self.d * np.sin(self.e * (self.Pmin - P)))
+        vpe = u * np.abs(self.d * np.sin(self.e * (self.Pmin - P)))
         return np.sum(base + vpe, axis=1)
 
     def reserve_gen(self, Pg):
@@ -101,6 +104,54 @@ class RealisticDispatchSimulator:
         power_cap = np.maximum(0.0, self.Pdis_max - Pdis_t)
         energy_cap = np.maximum(0.0, soc_t * self.eta_dis)
         return np.minimum(power_cap, energy_cap)
+
+    def _gen_priority(self):
+        ref_p = 0.5 * (self.Pmin + self.Pmax)
+        return np.argsort(self.b + 2.0 * self.c * ref_p)
+
+    def _build_seed_schedule(self, online_units):
+        u_seed = np.zeros((self.T, self.G), dtype=int)
+        u_seed[:, online_units] = 1
+
+        Pg_seed = np.zeros((self.T, self.G), dtype=float)
+        order = [g for g in self._gen_priority() if g in online_units]
+
+        for t in range(self.T):
+            cur = np.zeros(self.G, dtype=float)
+            if len(order) > 0:
+                cur[order] = self.Pmin[order]
+            residual = self.load[t] - np.sum(cur)
+
+            if residual > 0.0:
+                for g in order:
+                    room = self.Pmax[g] - cur[g]
+                    take = min(residual, room)
+                    cur[g] += take
+                    residual -= take
+                    if residual <= 1e-9:
+                        break
+
+            Pg_seed[t, :] = cur
+
+        Pch_seed = np.zeros((self.T,), dtype=float)
+        Pdis_seed = np.zeros((self.T,), dtype=float)
+        z_seed = np.full((self.T, self.G), -8.0, dtype=float)
+        z_seed[:, online_units] = 8.0
+        return z_seed, Pg_seed, Pch_seed, Pdis_seed
+
+    def inject_warm_starts(self, z, Pg, Pch, Pdis):
+        seed_sets = [
+            [1],
+            [0, 1],
+            [0, 1, 2],
+        ]
+        k = min(z.shape[0], len(seed_sets))
+        for i in range(k):
+            z_i, Pg_i, Pch_i, Pdis_i = self._build_seed_schedule(seed_sets[i])
+            z[i] = z_i
+            Pg[i] = Pg_i
+            Pch[i] = Pch_i
+            Pdis[i] = Pdis_i
 
     def decode_u(self, z):
         z = np.clip(z, -60, 60)
@@ -294,7 +345,8 @@ class RealisticDispatchSimulator:
 
         for t in range(self.T):
             P_t = Pg[:, t, :]
-            gen_cost_total += self.gen_cost(P_t)
+            curU = u[:, t, :]
+            gen_cost_total += self.gen_cost(P_t, curU)
 
             loss = self.loss(P_t)
             lhs = np.sum(P_t, axis=1) + Pdis[:, t] - Pch[:, t]
@@ -306,7 +358,6 @@ class RealisticDispatchSimulator:
             rtot = rgen + rst
             reserve_vio += np.maximum(0.0, self.R - rtot)
 
-            curU = u[:, t, :]
             both_on = (prevU == 1) & (curU == 1)
             ramp_up = np.maximum(0.0, (P_t - prevP) - self.RU) * both_on
             ramp_dn = np.maximum(0.0, (prevP - P_t) - self.RD) * both_on
@@ -354,6 +405,7 @@ class RealisticDispatchSimulator:
         Pg = self.rng.uniform(0.0, self.Pmax, size=(N, T, G))
         Pch = self.rng.uniform(0.0, self.Pch_max, size=(N, T))
         Pdis = self.rng.uniform(0.0, self.Pdis_max, size=(N, T))
+        self.inject_warm_starts(z, Pg, Pch, Pdis)
 
         Vz = np.zeros_like(z)
         Vg = np.zeros_like(Pg)
@@ -644,6 +696,23 @@ def main():
             f"{Pg[t,0]:7.2f} {Pg[t,1]:7.2f} {Pg[t,2]:7.2f} | "
             f"{Pch[t]:5.2f} {Pdis[t]:5.2f} | {soc[t]:7.2f}   (bal={lhs-rhs:+.3e})"
         )
+
+    sim_cmp = RealisticDispatchSimulator(PLoad, R_fixed=80.0, use_losses=False, use_valve_point=False, seed=42)
+    (u_cmp, Pg_cmp, Pch_cmp, Pdis_cmp), _ = sim_cmp.run(num_particles=120, max_iter=200)
+    fit_cmp, det_cmp = sim_cmp.evaluate(
+        Pg_cmp.reshape(1, sim_cmp.T, sim_cmp.G),
+        u_cmp.reshape(1, sim_cmp.T, sim_cmp.G),
+        Pch_cmp.reshape(1, sim_cmp.T),
+        Pdis_cmp.reshape(1, sim_cmp.T),
+    )
+    print("\n差异原因分析：")
+    print("1) 真实调度默认启用网损和阀点，MILP基线未启用这两项。")
+    print("2) 真实调度用PSO启发式搜索，MILP基线是确定性优化求解。")
+    print(f"3) 在同假设（无网损/无阀点）下，本脚本PSO目标值: {float(fit_cmp[0]):.4f}")
+    print(
+        f"   分解成本: Gen=${float(det_cmp['gen_cost'][0]):.4f}, "
+        f"Storage=${float(det_cmp['storage_cost'][0]):.4f}, SU/SD=${float(det_cmp['su_sd_cost'][0]):.4f}"
+    )
 
     try:
         plt.style.use("seaborn-v0_8-whitegrid")
