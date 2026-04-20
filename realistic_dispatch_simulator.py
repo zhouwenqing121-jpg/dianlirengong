@@ -560,7 +560,8 @@ def _compute_series(sim, load_profile, u, Pg, Pch, Pdis, soc):
     rhs = load_profile + losses
     balance_residual = lhs - rhs
 
-    reserve_total = sim.reserve_gen(Pg) + sim.reserve_storage(Pdis, soc[:T])
+    soc_for_reserve = soc[:T] if soc.shape[0] >= T else np.pad(soc, (0, T - soc.shape[0]), mode="edge")
+    reserve_total = sim.reserve_gen(Pg) + sim.reserve_storage(Pdis, soc_for_reserve)
     reserve_margin = reserve_total - sim.R
 
     ramp_vio_by_hour = np.zeros(T, dtype=float)
@@ -765,13 +766,17 @@ def generate_comparison_artifacts(method_results, out_dir):
         if method_results[baseline_idx]["solve_time_sec"] > 0
         else MIN_BASELINE_TIME
     )
+    # Small floor avoids division-by-zero when baseline violations are (near) zero.
     baseline_balance = max(method_results[baseline_idx].get("balance_mm_mw", 0.0), MIN_BASELINE_DENOMINATOR)
     baseline_reserve = max(method_results[baseline_idx].get("reserve_violation_mw", 0.0), MIN_BASELINE_DENOMINATOR)
     baseline_ramp = max(method_results[baseline_idx].get("ramp_violation_mw", 0.0), MIN_BASELINE_DENOMINATOR)
 
+    def _cost_saving_pct(total_cost):
+        return (baseline_cost - total_cost) / baseline_cost * 100.0 if baseline_cost != 0 else 0.0
+
     rows = []
     for r in method_results:
-        cost_save = (baseline_cost - r["total_cost_usd"]) / baseline_cost * 100.0 if baseline_cost != 0 else 0.0
+        cost_save = _cost_saving_pct(r["total_cost_usd"])
         rows.append(
             {
                 "method": r["method"],
