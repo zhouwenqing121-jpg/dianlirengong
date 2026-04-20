@@ -1,3 +1,4 @@
+import argparse
 import os
 import numpy as np
 import matplotlib
@@ -631,7 +632,22 @@ def plot_ppt_figures(sim, PLoad, u, Pg, Pch, Pdis, det, hist, out_dir="ppt_figur
     print("Saved files: 01_load.png .. 07_convergence.png")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="UC+DED dispatch simulator (PSO).")
+    parser.add_argument(
+        "--mode",
+        choices=["aligned", "realistic"],
+        default="aligned",
+        help="aligned: 与MILP基线对齐（无网损/无阀点）；realistic: 启用网损与阀点。",
+    )
+    parser.add_argument("--num-particles", type=int, default=120, help="PSO粒子数")
+    parser.add_argument("--max-iter", type=int, default=200, help="PSO迭代次数")
+    parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     PLoad = np.array(
         [
             272.563258729604,
@@ -662,8 +678,15 @@ def main():
         dtype=float,
     )
 
-    sim = RealisticDispatchSimulator(PLoad, R_fixed=80.0, use_losses=True, use_valve_point=True, seed=42)
-    (u, Pg, Pch, Pdis), hist = sim.run(num_particles=120, max_iter=200)
+    aligned_mode = args.mode == "aligned"
+    sim = RealisticDispatchSimulator(
+        PLoad,
+        R_fixed=80.0,
+        use_losses=not aligned_mode,
+        use_valve_point=not aligned_mode,
+        seed=args.seed,
+    )
+    (u, Pg, Pch, Pdis), hist = sim.run(num_particles=args.num_particles, max_iter=args.max_iter)
 
     fit, det = sim.evaluate(
         Pg.reshape(1, sim.T, sim.G),
@@ -674,7 +697,10 @@ def main():
     det = {k: float(v[0]) if isinstance(v, np.ndarray) and v.ndim == 1 else v for k, v in det.items()}
 
     print("=" * 95)
-    print("真实调度仿真（UC + DED + 储能 + 备用 + 爬坡 + 网损 + 阀点）")
+    if aligned_mode:
+        print("对齐调度仿真（UC + DED + 储能 + 备用 + 爬坡，无网损/无阀点，与MILP基线一致）")
+    else:
+        print("真实调度仿真（UC + DED + 储能 + 备用 + 爬坡 + 网损 + 阀点）")
     print("=" * 95)
     print(f"Best fitness:         {float(fit[0]):.4f}")
     print(f"Total gen cost:      ${det['gen_cost']:.4f}")
@@ -697,22 +723,7 @@ def main():
             f"{Pch[t]:5.2f} {Pdis[t]:5.2f} | {soc[t]:7.2f}   (bal={lhs-rhs:+.3e})"
         )
 
-    sim_cmp = RealisticDispatchSimulator(PLoad, R_fixed=80.0, use_losses=False, use_valve_point=False, seed=42)
-    (u_cmp, Pg_cmp, Pch_cmp, Pdis_cmp), _ = sim_cmp.run(num_particles=120, max_iter=200)
-    fit_cmp, det_cmp = sim_cmp.evaluate(
-        Pg_cmp.reshape(1, sim_cmp.T, sim_cmp.G),
-        u_cmp.reshape(1, sim_cmp.T, sim_cmp.G),
-        Pch_cmp.reshape(1, sim_cmp.T),
-        Pdis_cmp.reshape(1, sim_cmp.T),
-    )
-    print("\n差异原因分析：")
-    print("1) 真实调度默认启用网损和阀点，MILP基线未启用这两项。")
-    print("2) 真实调度用PSO启发式搜索，MILP基线是确定性优化求解。")
-    print(f"3) 在同假设（无网损/无阀点）下，本脚本PSO目标值: {float(fit_cmp[0]):.4f}")
-    print(
-        f"   分解成本: Gen=${float(det_cmp['gen_cost'][0]):.4f}, "
-        f"Storage=${float(det_cmp['storage_cost'][0]):.4f}, SU/SD=${float(det_cmp['su_sd_cost'][0]):.4f}"
-    )
+    print(f"\n运行模式: {args.mode}  (use_losses={sim.use_losses}, use_valve_point={sim.use_valve_point})")
 
     try:
         plt.style.use("seaborn-v0_8-whitegrid")
@@ -737,7 +748,8 @@ def main():
     fig.savefig("summary.png")
     plt.close(fig)
 
-    plot_ppt_figures(sim, PLoad, u, Pg, Pch, Pdis, det, hist, out_dir="ppt_figures")
+    out_dir = "ppt_figures_aligned" if aligned_mode else "ppt_figures_realistic"
+    plot_ppt_figures(sim, PLoad, u, Pg, Pch, Pdis, det, hist, out_dir=out_dir)
 
 
 if __name__ == "__main__":
