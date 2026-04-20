@@ -309,7 +309,7 @@ for t = 1:T+1
     ub(idx.E(t)) = Emax;
 end
 
-intcon = [idx.u(:); idx.y(:); idx.z(:); idx.smode(:)]';
+intcon = [idx.u(:); idx.y(:); idx.z(:); idx.smode(:)];
 ub(intcon) = 1;
 
 %% ------------------------ 求解 ------------------------
