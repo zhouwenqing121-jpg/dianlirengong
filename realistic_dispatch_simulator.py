@@ -697,6 +697,23 @@ def main():
             f"{Pch[t]:5.2f} {Pdis[t]:5.2f} | {soc[t]:7.2f}   (bal={lhs-rhs:+.3e})"
         )
 
+    sim_cmp = RealisticDispatchSimulator(PLoad, R_fixed=80.0, use_losses=False, use_valve_point=False, seed=42)
+    (u_cmp, Pg_cmp, Pch_cmp, Pdis_cmp), _ = sim_cmp.run(num_particles=120, max_iter=200)
+    fit_cmp, det_cmp = sim_cmp.evaluate(
+        Pg_cmp.reshape(1, sim_cmp.T, sim_cmp.G),
+        u_cmp.reshape(1, sim_cmp.T, sim_cmp.G),
+        Pch_cmp.reshape(1, sim_cmp.T),
+        Pdis_cmp.reshape(1, sim_cmp.T),
+    )
+    print("\n差异原因分析：")
+    print("1) 真实调度默认启用网损和阀点，MILP基线未启用这两项。")
+    print("2) 真实调度用PSO启发式搜索，MILP基线是确定性优化求解。")
+    print(f"3) 在同假设（无网损/无阀点）下，本脚本PSO目标值: {float(fit_cmp[0]):.4f}")
+    print(
+        f"   分解成本: Gen=${float(det_cmp['gen_cost'][0]):.4f}, "
+        f"Storage=${float(det_cmp['storage_cost'][0]):.4f}, SU/SD=${float(det_cmp['su_sd_cost'][0]):.4f}"
+    )
+
     try:
         plt.style.use("seaborn-v0_8-whitegrid")
     except OSError:
