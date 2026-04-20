@@ -1,5 +1,8 @@
 import argparse
+import csv
+import json
 import os
+import time
 import numpy as np
 import matplotlib
 
@@ -519,24 +522,11 @@ class RealisticDispatchSimulator:
         return (u_best2, Pg_best, Pch_best, Pdis_best), hist
 
 
-def plot_ppt_figures(sim, PLoad, u, Pg, Pch, Pdis, det, hist, out_dir="ppt_figures"):
-    os.makedirs(out_dir, exist_ok=True)
-
-    T = sim.T
-    G = sim.G
-    hours = np.arange(T)
-
-    soc = det["soc"][0]
-
-    losses = np.array([sim.loss(Pg[t, :].reshape(1, -1))[0] for t in range(T)])
-    lhs = Pg.sum(axis=1) + Pdis - Pch
-    rhs = PLoad + losses
-    bal_res = lhs - rhs
-
-    rgen = np.array([sim.reserve_gen(Pg[t, :].reshape(1, -1))[0] for t in range(T)])
-    rst = np.array([sim.reserve_storage(np.array([Pdis[t]]), np.array([soc[t]]))[0] for t in range(T)])
-    rtot = rgen + rst
-
+def _set_plot_style():
+    try:
+        plt.style.use("seaborn-v0_8-whitegrid")
+    except OSError:
+        plt.style.use("default")
     plt.rcParams.update(
         {
             "figure.dpi": 120,
@@ -544,96 +534,308 @@ def plot_ppt_figures(sim, PLoad, u, Pg, Pch, Pdis, det, hist, out_dir="ppt_figur
             "font.size": 11,
             "axes.titlesize": 13,
             "axes.labelsize": 11,
-            "legend.fontsize": 10,
+            "legend.fontsize": 9,
             "axes.grid": True,
             "grid.alpha": 0.25,
-            "lines.linewidth": 2.2,
+            "lines.linewidth": 2.0,
         }
     )
 
-    fig = plt.figure(figsize=(9, 4.5))
-    plt.plot(hours, PLoad, marker="o")
-    plt.title("24h Load Profile")
-    plt.xlabel("Hour")
-    plt.ylabel("Load (MW)")
-    plt.tight_layout()
-    fig.savefig(os.path.join(out_dir, "01_load.png"))
-    plt.close(fig)
 
-    fig = plt.figure(figsize=(10, 5))
+def _save_dual_resolution(fig, out_dir, base_name):
+    debug_path = os.path.join(out_dir, f"{base_name}_debug.png")
+    hd_path = os.path.join(out_dir, f"{base_name}_hd.png")
+    fig.savefig(debug_path, dpi=120, bbox_inches="tight")
+    fig.savefig(hd_path, dpi=300, bbox_inches="tight")
+
+
+def _compute_series(sim, load_profile, u, Pg, Pch, Pdis, soc):
+    T = sim.T
+    losses = np.array([sim.loss(Pg[t, :].reshape(1, -1))[0] for t in range(T)])
+    lhs = Pg.sum(axis=1) + Pdis - Pch
+    rhs = load_profile + losses
+    balance_residual = lhs - rhs
+
+    reserve_total = np.array(
+        [
+            sim.reserve_gen(Pg[t, :].reshape(1, -1))[0] + sim.reserve_storage(np.array([Pdis[t]]), np.array([soc[t]]))[0]
+            for t in range(T)
+        ]
+    )
+    reserve_margin = reserve_total - sim.R
+
+    ramp_vio_by_hour = np.zeros(T, dtype=float)
+    for t in range(1, T):
+        both_on = (u[t - 1, :] == 1) & (u[t, :] == 1)
+        ramp_up = np.maximum(0.0, (Pg[t, :] - Pg[t - 1, :]) - sim.RU) * both_on
+        ramp_dn = np.maximum(0.0, (Pg[t - 1, :] - Pg[t, :]) - sim.RD) * both_on
+        ramp_vio_by_hour[t] = np.sum(ramp_up + ramp_dn)
+    return losses, balance_residual, reserve_total, reserve_margin, ramp_vio_by_hour
+
+
+def build_unified_result(method_name, sim, load_profile, u, Pg, Pch, Pdis, det, solve_time_sec):
+    soc = det["soc"][0] if isinstance(det["soc"], np.ndarray) and det["soc"].ndim > 1 else np.array(det["soc"], dtype=float)
+    _, balance_residual, reserve_total, reserve_margin, ramp_vio_by_hour = _compute_series(
+        sim, load_profile, u, Pg, Pch, Pdis, soc
+    )
+
+    total_cost = float(det.get("gen_cost", 0.0)) + float(det.get("storage_cost", 0.0)) + float(det.get("su_sd_cost", 0.0))
+    if isinstance(det.get("gen_cost"), np.ndarray):
+        total_cost = float(det["gen_cost"][0] + det["storage_cost"][0] + det["su_sd_cost"][0])
+    if "total_cost" in det:
+        total_cost = float(det["total_cost"])
+
+    balance_mm = float(np.sum(np.abs(balance_residual)))
+    reserve_vio = float(np.sum(np.maximum(0.0, -reserve_margin)))
+    ramp_vio = float(np.sum(ramp_vio_by_hour))
+
+    return {
+        "method": method_name,
+        "T": int(sim.T),
+        "G": int(sim.G),
+        "load_mw": np.array(load_profile, dtype=float),
+        "u": np.array(u, dtype=int),
+        "Pg_mw": np.array(Pg, dtype=float),
+        "Pch_mw": np.array(Pch, dtype=float),
+        "Pdis_mw": np.array(Pdis, dtype=float),
+        "soc_mwh": np.array(soc, dtype=float),
+        "total_cost_usd": total_cost,
+        "balance_residual_mw": balance_residual,
+        "balance_mm_mw": balance_mm,
+        "reserve_total_mw": reserve_total,
+        "reserve_margin_mw": reserve_margin,
+        "reserve_violation_mw": reserve_vio,
+        "ramp_violation_by_hour_mw": ramp_vio_by_hour,
+        "ramp_violation_mw": ramp_vio,
+        "soc_end_mwh": float(soc[-1]),
+        "solve_time_sec": float(solve_time_sec),
+        "constraints_ok": {
+            "balance": bool(np.max(np.abs(balance_residual)) <= 1e-3),
+            "reserve": bool(np.min(reserve_margin) >= -1e-6),
+            "ramp": bool(ramp_vio <= 1e-6),
+            "soc_end": bool(abs(soc[-1] - sim.soc0) <= 1e-6),
+        },
+    }
+
+
+def load_unified_result_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    for key in ["method", "load_mw", "Pg_mw", "Pch_mw", "Pdis_mw", "soc_mwh", "total_cost_usd", "solve_time_sec"]:
+        if key not in data:
+            raise ValueError(f"Missing key in {path}: {key}")
+    out = dict(data)
+    for k in ["load_mw", "Pg_mw", "Pch_mw", "Pdis_mw", "soc_mwh", "balance_residual_mw", "reserve_margin_mw"]:
+        if k in out:
+            out[k] = np.array(out[k], dtype=float)
+    out["total_cost_usd"] = float(out["total_cost_usd"])
+    out["solve_time_sec"] = float(out["solve_time_sec"])
+    if "T" not in out:
+        out["T"] = int(len(out["load_mw"]))
+    if "G" not in out:
+        out["G"] = int(out["Pg_mw"].shape[1]) if out["Pg_mw"].ndim == 2 else 1
+    if "balance_mm_mw" not in out and "balance_residual_mw" in out:
+        out["balance_mm_mw"] = float(np.sum(np.abs(out["balance_residual_mw"])))
+    if "reserve_violation_mw" not in out and "reserve_margin_mw" in out:
+        out["reserve_violation_mw"] = float(np.sum(np.maximum(0.0, -out["reserve_margin_mw"])))
+    if "ramp_violation_mw" not in out:
+        out["ramp_violation_mw"] = float(out.get("ramp_violation_mw", 0.0))
+    return out
+
+
+def plot_dispatch_figures(sim, unified_result, hist, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    _set_plot_style()
+    T, G = sim.T, sim.G
+    hours = np.arange(T)
+    Pg = unified_result["Pg_mw"]
+    Pch = unified_result["Pch_mw"]
+    Pdis = unified_result["Pdis_mw"]
+    soc = unified_result["soc_mwh"]
+    load_profile = unified_result["load_mw"]
+    balance_residual = unified_result["balance_residual_mw"]
+    reserve_margin = unified_result["reserve_margin_mw"]
+    reserve_total = unified_result["reserve_total_mw"]
+    method = unified_result["method"]
+    ok = unified_result["constraints_ok"]
+
+    fig = plt.figure(figsize=(10, 5.2))
     labels = [f"G{i + 1}" for i in range(G)]
     plt.stackplot(hours, Pg.T, labels=labels, alpha=0.85)
-    net_storage = Pdis - Pch
-    plt.plot(hours, net_storage, color="k", linestyle="--", label="Storage net (Pdis-Pch)")
-    plt.plot(hours, PLoad, color="red", marker=".", label="Load")
-    plt.title("Dispatch Stack (Generators) + Storage Net + Load")
+    plt.plot(hours, Pdis - Pch, color="#111827", linestyle="--", label="Storage Net (Pdis-Pch)")
+    plt.plot(hours, load_profile, color="#dc2626", marker=".", label="Load")
+    txt = f"Balance:{'OK' if ok['balance'] else 'FAIL'} | Reserve:{'OK' if ok['reserve'] else 'FAIL'} | Ramp:{'OK' if ok['ramp'] else 'FAIL'}"
+    plt.text(0.01, 0.99, txt, transform=plt.gca().transAxes, va="top", bbox=dict(boxstyle="round", fc="white", alpha=0.9))
+    plt.title(f"01 Dispatch Main ({method})")
     plt.xlabel("Hour")
     plt.ylabel("Power (MW)")
     plt.legend(loc="upper left", ncol=2)
-    plt.tight_layout()
-    fig.savefig(os.path.join(out_dir, "02_dispatch_stack.png"))
+    _save_dual_resolution(fig, out_dir, "01_dispatch_main")
     plt.close(fig)
 
     fig = plt.figure(figsize=(10, 4.5))
-    plt.bar(hours - 0.15, Pch, width=0.3, label="Charge (Pch)", color="#1f77b4")
-    plt.bar(hours + 0.15, Pdis, width=0.3, label="Discharge (Pdis)", color="#ff7f0e")
-    plt.title("Storage Power (Charge/Discharge)")
+    plt.bar(hours - 0.18, Pch, width=0.36, label="Charge Pch", color="#2563eb")
+    plt.bar(hours + 0.18, Pdis, width=0.36, label="Discharge Pdis", color="#f97316")
+    plt.title("02 Storage Charge/Discharge Power")
     plt.xlabel("Hour")
     plt.ylabel("Power (MW)")
-    plt.legend()
-    plt.tight_layout()
-    fig.savefig(os.path.join(out_dir, "03_storage_power.png"))
+    plt.legend(loc="upper right")
+    _save_dual_resolution(fig, out_dir, "02_storage_power")
     plt.close(fig)
 
     fig = plt.figure(figsize=(10, 4.5))
-    plt.plot(np.arange(T + 1), soc, marker="o")
-    plt.axhline(sim.soc0, color="k", linestyle="--", alpha=0.7, label="SOC target (SOC0)")
-    plt.title("Storage State of Charge (SOC)")
+    plt.plot(np.arange(T + 1), soc, marker="o", color="#0f766e")
+    plt.axhline(sim.soc0, color="k", linestyle="--", alpha=0.7, label=f"SOC target={sim.soc0:.1f}")
+    plt.text(0.01, 0.99, f"SOC End:{'OK' if ok['soc_end'] else 'FAIL'}", transform=plt.gca().transAxes, va="top", bbox=dict(boxstyle="round", fc="white", alpha=0.9))
+    plt.title("03 Storage SOC")
     plt.xlabel("Hour")
     plt.ylabel("SOC (MWh)")
-    plt.legend()
-    plt.tight_layout()
-    fig.savefig(os.path.join(out_dir, "04_soc.png"))
+    plt.legend(loc="best")
+    _save_dual_resolution(fig, out_dir, "03_soc")
     plt.close(fig)
 
     fig = plt.figure(figsize=(10, 4.5))
-    plt.plot(hours, rtot, marker="o", label="Reachable reserve (Gen + Storage)")
-    plt.axhline(sim.R, color="red", linestyle="--", label=f"Reserve requirement R={sim.R:.0f} MW")
-    plt.fill_between(hours, rtot, sim.R, where=(rtot < sim.R), color="red", alpha=0.15, label="Violation")
-    plt.title("Reachable Spinning Reserve")
-    plt.xlabel("Hour")
-    plt.ylabel("Reserve (MW)")
-    plt.legend()
-    plt.tight_layout()
-    fig.savefig(os.path.join(out_dir, "05_reserve.png"))
-    plt.close(fig)
-
-    fig = plt.figure(figsize=(10, 4.5))
-    plt.axhline(0.0, color="k", linewidth=1.5)
-    plt.plot(hours, bal_res, marker="o")
-    plt.title("Power Balance Residual: (ΣPg + Pdis - Pch) - (Load + Loss)")
+    plt.axhline(0.0, color="k", linewidth=1.2)
+    plt.plot(hours, balance_residual, marker="o", color="#7c3aed")
+    plt.text(
+        0.01,
+        0.99,
+        f"max|res|={np.max(np.abs(balance_residual)):.3e} MW ({'OK' if ok['balance'] else 'FAIL'})",
+        transform=plt.gca().transAxes,
+        va="top",
+        bbox=dict(boxstyle="round", fc="white", alpha=0.9),
+    )
+    plt.title("04 Power Balance Residual")
     plt.xlabel("Hour")
     plt.ylabel("Residual (MW)")
-    plt.tight_layout()
-    fig.savefig(os.path.join(out_dir, "06_balance_residual.png"))
+    _save_dual_resolution(fig, out_dir, "04_balance_residual")
     plt.close(fig)
 
-    fig = plt.figure(figsize=(9, 4.5))
-    total_cost_hist = np.array(hist["gen_cost"]) + np.array(hist["storage_cost"]) + np.array(hist["su_sd_cost"])
-    plt.plot(total_cost_hist)
-    plt.title("PSO Convergence: Total Cost (Gen + Storage + SU/SD)")
-    plt.xlabel("Iteration")
-    plt.ylabel("Cost ($)")
-    plt.tight_layout()
-    fig.savefig(os.path.join(out_dir, "07_convergence.png"))
+    fig = plt.figure(figsize=(10, 4.5))
+    plt.plot(hours, reserve_total, marker="o", label="Reachable reserve", color="#0284c7")
+    plt.axhline(sim.R, color="#dc2626", linestyle="--", label=f"Requirement R={sim.R:.0f} MW")
+    plt.fill_between(hours, reserve_total, sim.R, where=(reserve_margin < 0), color="#dc2626", alpha=0.15, label="Violation")
+    plt.text(
+        0.01,
+        0.99,
+        f"min margin={np.min(reserve_margin):.3e} MW ({'OK' if ok['reserve'] else 'FAIL'})",
+        transform=plt.gca().transAxes,
+        va="top",
+        bbox=dict(boxstyle="round", fc="white", alpha=0.9),
+    )
+    plt.title("05 Reserve Margin")
+    plt.xlabel("Hour")
+    plt.ylabel("Reserve (MW)")
+    plt.legend(loc="best")
+    _save_dual_resolution(fig, out_dir, "05_reserve_margin")
     plt.close(fig)
 
-    print(f"[OK] PPT figures saved to: {os.path.abspath(out_dir)}")
-    print("Saved files: 01_load.png .. 07_convergence.png")
+    if hist and len(hist.get("gen_cost", [])) > 0:
+        fig = plt.figure(figsize=(9, 4.5))
+        total_cost_hist = np.array(hist["gen_cost"]) + np.array(hist["storage_cost"]) + np.array(hist["su_sd_cost"])
+        plt.plot(total_cost_hist, color="#374151")
+        plt.title("06 Convergence: Total Cost")
+        plt.xlabel("Iteration")
+        plt.ylabel("Cost ($)")
+        _save_dual_resolution(fig, out_dir, "06_convergence")
+        plt.close(fig)
+
+
+def generate_comparison_artifacts(method_results, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    _set_plot_style()
+    methods = [r["method"] for r in method_results]
+    baseline_idx = methods.index("MILP") if "MILP" in methods else 0
+    baseline_cost = method_results[baseline_idx]["total_cost_usd"]
+    baseline_time = method_results[baseline_idx]["solve_time_sec"] if method_results[baseline_idx]["solve_time_sec"] > 0 else 1.0
+    baseline_balance = max(method_results[baseline_idx].get("balance_mm_mw", 0.0), 1e-12)
+    baseline_reserve = max(method_results[baseline_idx].get("reserve_violation_mw", 0.0), 1e-12)
+    baseline_ramp = max(method_results[baseline_idx].get("ramp_violation_mw", 0.0), 1e-12)
+
+    rows = []
+    for r in method_results:
+        cost_save = (baseline_cost - r["total_cost_usd"]) / baseline_cost * 100.0 if baseline_cost != 0 else 0.0
+        rows.append(
+            {
+                "method": r["method"],
+                "total_cost_usd": float(r["total_cost_usd"]),
+                "balance_mm_mw": float(r.get("balance_mm_mw", np.nan)),
+                "reserve_violation_mw": float(r.get("reserve_violation_mw", np.nan)),
+                "ramp_violation_mw": float(r.get("ramp_violation_mw", np.nan)),
+                "solve_time_sec": float(r["solve_time_sec"]),
+                "cost_saving_pct_vs_baseline": float(cost_save),
+            }
+        )
+
+    csv_path = os.path.join(out_dir, "08_method_comparison_table.csv")
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    categories = [
+        "Cost",
+        "BalanceMM",
+        "ReserveVio",
+        "RampVio",
+        "Time",
+    ]
+    values = []
+    for r in rows:
+        values.append(
+            [
+                (r["total_cost_usd"] / baseline_cost * 100.0) if baseline_cost != 0 else 0.0,
+                (r["balance_mm_mw"] / baseline_balance * 100.0) if baseline_balance != 0 else 0.0,
+                (r["reserve_violation_mw"] / baseline_reserve * 100.0) if baseline_reserve != 0 else 0.0,
+                (r["ramp_violation_mw"] / baseline_ramp * 100.0) if baseline_ramp != 0 else 0.0,
+                (r["solve_time_sec"] / baseline_time * 100.0) if baseline_time != 0 else 0.0,
+            ]
+        )
+    values = np.array(values)
+
+    fig = plt.figure(figsize=(11, 6))
+    y = np.arange(len(categories))
+    bar_h = 0.75 / max(1, len(methods))
+    for i, m in enumerate(methods):
+        offset = (i - (len(methods) - 1) / 2) * bar_h
+        plt.barh(y + offset, values[i], height=bar_h, label=m)
+    plt.axvline(100.0, color="#111827", linestyle="--", linewidth=1.2, label="Baseline=100%")
+    plt.yticks(y, categories)
+    plt.xlabel("Relative value (%)")
+    plt.title("07 Method Comparison (Grouped Horizontal Bars)")
+    plt.legend(loc="lower right")
+    _save_dual_resolution(fig, out_dir, "07_method_comparison")
+    plt.close(fig)
+    return rows
+
+
+def export_consistency_report(method_results, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    load_ref = method_results[0]["load_mw"]
+    same_load = all(np.allclose(r["load_mw"], load_ref, atol=1e-6) for r in method_results)
+    same_horizon = all(int(r["T"]) == int(method_results[0]["T"]) for r in method_results)
+
+    best_cost = min(method_results, key=lambda r: r["total_cost_usd"])["method"]
+    fastest = min(method_results, key=lambda r: r["solve_time_sec"])["method"]
+    least_vio = min(
+        method_results,
+        key=lambda r: (r.get("balance_mm_mw", 0.0) + r.get("reserve_violation_mw", 0.0) + r.get("ramp_violation_mw", 0.0)),
+    )["method"]
+
+    report_path = os.path.join(out_dir, "08_consistency_check.txt")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("Consistency Check Report\n")
+        f.write("========================\n")
+        f.write(f"same_load_profile: {same_load}\n")
+        f.write(f"same_horizon: {same_horizon}\n")
+        f.write(f"lowest_cost_method: {best_cost}\n")
+        f.write(f"fastest_method: {fastest}\n")
+        f.write(f"least_total_violation_method: {least_vio}\n")
+    return report_path
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="UC+DED dispatch simulator (PSO).")
+    parser = argparse.ArgumentParser(description="UC+DED dispatch simulator (PSO) with unified comparison artifacts.")
     parser.add_argument(
         "--mode",
         choices=["aligned", "realistic"],
@@ -643,6 +845,10 @@ def parse_args():
     parser.add_argument("--num-particles", type=int, default=120, help="PSO粒子数")
     parser.add_argument("--max-iter", type=int, default=200, help="PSO迭代次数")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser.add_argument("--milp-json", type=str, default="", help="MILP统一结果JSON（可选）")
+    parser.add_argument("--dl-json", type=str, default="", help="深度学习统一结果JSON（可选）")
+    parser.add_argument("--rl-json", type=str, default="", help="强化学习统一结果JSON（可选；为空时使用本脚本PSO结果）")
+    parser.add_argument("--out-root", type=str, default="outputs", help="输出根目录")
     return parser.parse_args()
 
 
@@ -686,7 +892,9 @@ def main():
         use_valve_point=not aligned_mode,
         seed=args.seed,
     )
+    t0 = time.perf_counter()
     (u, Pg, Pch, Pdis), hist = sim.run(num_particles=args.num_particles, max_iter=args.max_iter)
+    solve_time = time.perf_counter() - t0
 
     fit, det = sim.evaluate(
         Pg.reshape(1, sim.T, sim.G),
@@ -695,6 +903,9 @@ def main():
         Pdis.reshape(1, sim.T),
     )
     det = {k: float(v[0]) if isinstance(v, np.ndarray) and v.ndim == 1 else v for k, v in det.items()}
+    det["total_cost"] = float(det["gen_cost"] + det["storage_cost"] + det["su_sd_cost"])
+
+    pso_result = build_unified_result("RL-PSO", sim, PLoad, u, Pg, Pch, Pdis, det, solve_time)
 
     print("=" * 95)
     if aligned_mode:
@@ -703,12 +914,13 @@ def main():
         print("真实调度仿真（UC + DED + 储能 + 备用 + 爬坡 + 网损 + 阀点）")
     print("=" * 95)
     print(f"Best fitness:         {float(fit[0]):.4f}")
+    print(f"Solve time:           {solve_time:.4f} s")
     print(f"Total gen cost:      ${det['gen_cost']:.4f}")
     print(f"Storage cycling cost:${det['storage_cost']:.4f}")
     print(f"Startup/shutdown:    ${det['su_sd_cost']:.4f}")
-    print(f"Balance mismatch sum:{det['balance_mm']:.6e} MW")
-    print(f"Reserve violation:   {det['reserve_vio']:.6e} MW")
-    print(f"Ramp violation:      {det['ramp_vio']:.6e} MW")
+    print(f"Balance mismatch sum:{pso_result['balance_mm_mw']:.6e} MW")
+    print(f"Reserve violation:   {pso_result['reserve_violation_mw']:.6e} MW")
+    print(f"Ramp violation:      {pso_result['ramp_violation_mw']:.6e} MW")
     print(f"SOC end:             {det['soc_end']:.3f} MWh (target {sim.soc0:.3f})")
 
     soc = det["soc"][0]
@@ -725,31 +937,32 @@ def main():
 
     print(f"\n运行模式: {args.mode}  (use_losses={sim.use_losses}, use_valve_point={sim.use_valve_point})")
 
-    try:
-        plt.style.use("seaborn-v0_8-whitegrid")
-    except OSError:
-        plt.style.use("default")
+    scenario_dir = "aligned" if aligned_mode else "realistic"
+    out_dir = os.path.join(args.out_root, scenario_dir)
+    dispatch_dir = os.path.join(out_dir, "dispatch")
+    compare_dir = os.path.join(out_dir, "compare")
+    os.makedirs(dispatch_dir, exist_ok=True)
+    os.makedirs(compare_dir, exist_ok=True)
 
-    fig, axs = plt.subplots(2, 2, figsize=(12, 8), dpi=110)
-    axs = axs.ravel()
-    axs[0].plot(np.array(hist["gen_cost"]) + np.array(hist["storage_cost"]) + np.array(hist["su_sd_cost"]), lw=2)
-    axs[0].set_title("Total Cost (Gen + Storage + SU/SD)")
-    axs[0].grid(True)
-    axs[1].semilogy(np.maximum(hist["balance_mm"], 1e-18), lw=2)
-    axs[1].set_title("Balance mismatch (log)")
-    axs[1].grid(True)
-    axs[2].semilogy(np.maximum(hist["reserve_vio"], 1e-18), lw=2)
-    axs[2].set_title("Reserve violation (log)")
-    axs[2].grid(True)
-    axs[3].plot(hist["soc_end"], lw=2)
-    axs[3].set_title("End SOC (MWh)")
-    axs[3].grid(True)
-    plt.tight_layout()
-    fig.savefig("summary.png")
-    plt.close(fig)
+    method_results = []
+    if args.milp_json:
+        method_results.append(load_unified_result_json(args.milp_json))
+    if args.dl_json:
+        method_results.append(load_unified_result_json(args.dl_json))
+    if args.rl_json:
+        method_results.append(load_unified_result_json(args.rl_json))
+    else:
+        method_results.append(pso_result)
 
-    out_dir = "ppt_figures_aligned" if aligned_mode else "ppt_figures_realistic"
-    plot_ppt_figures(sim, PLoad, u, Pg, Pch, Pdis, det, hist, out_dir=out_dir)
+    plot_dispatch_figures(sim, pso_result, hist, dispatch_dir)
+    comparison_rows = generate_comparison_artifacts(method_results, compare_dir)
+    report_path = export_consistency_report(method_results, compare_dir)
+
+    print(f"[OK] Dispatch figures saved: {os.path.abspath(dispatch_dir)}")
+    print(f"[OK] Comparison table/chart saved: {os.path.abspath(compare_dir)}")
+    print(f"[OK] Consistency report: {report_path}")
+    print(f"Methods in comparison: {[r['method'] for r in method_results]}")
+    print(f"Comparison rows: {len(comparison_rows)}")
 
 
 if __name__ == "__main__":

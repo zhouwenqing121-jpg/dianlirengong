@@ -320,7 +320,9 @@ opts = optimoptions('intlinprog', ...
     'RelativeGapTolerance',1e-4, ...
     'MaxTime',300);
 
+tic;
 [x, fval, exitflag, output] = intlinprog(f, intcon, A, bvec, Aeq, beq, lb, ub, opts);
+solveTime = toc;
 
 if exitflag <= 0
     warning('intlinprog 未找到最优可行解，exitflag=%d', exitflag);
@@ -350,11 +352,14 @@ balanceResidual = sum(Pg,2) + Pdis - Pch - loadProfile;
 reserveMargin = sum(Rg,2) + Rs - Rreq;
 
 rampVio = 0;
+rampVioByHour = zeros(T,1);
 for g = 1:G
     for t = 2:T
         if u(t-1,g) == 1 && u(t,g) == 1
-            rampVio = rampVio + max(0, Pg(t,g)-Pg(t-1,g)-RU(g));
-            rampVio = rampVio + max(0, Pg(t-1,g)-Pg(t,g)-RD(g));
+            upV = max(0, Pg(t,g)-Pg(t-1,g)-RU(g));
+            dnV = max(0, Pg(t-1,g)-Pg(t,g)-RD(g));
+            rampVio = rampVio + upV + dnV;
+            rampVioByHour(t) = rampVioByHour(t) + upV + dnV;
         end
     end
 end
@@ -368,12 +373,18 @@ results.z = z;
 results.Pch = Pch;
 results.Pdis = Pdis;
 results.E = E;
+results.SOC = E;
 results.Rg = Rg;
 results.Rs = Rs;
+results.load = loadProfile;
+results.balance_residual = balanceResidual;
+results.reserve_margin = reserveMargin;
+results.ramp_vio_by_hour = rampVioByHour;
 results.balance_mm = sum(abs(balanceResidual));
 results.reserve_vio = sum(max(0,-reserveMargin));
 results.ramp_vio = rampVio;
 results.soc_end = E(end);
+results.solve_time_sec = solveTime;
 results.exitflag = exitflag;
 results.output = output;
 
@@ -381,6 +392,7 @@ fprintf('\n===============================================================\n');
 fprintf('非学习算法对照组（MILP + intlinprog）\n');
 fprintf('===============================================================\n');
 fprintf('Objective (MILP):      %.4f\n', results.total_cost);
+fprintf('Solve time:            %.3f s\n', results.solve_time_sec);
 fprintf('Balance mismatch sum:  %.6e MW\n', results.balance_mm);
 fprintf('Reserve violation sum: %.6e MW\n', results.reserve_vio);
 fprintf('Ramp violation sum:    %.6e MW\n', results.ramp_vio);
