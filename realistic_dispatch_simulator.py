@@ -10,6 +10,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+MIN_BASELINE_DENOMINATOR = 1e-12
+BAR_HEIGHT_SCALE = 0.75
+
 
 class RealisticDispatchSimulator:
     """
@@ -551,17 +554,12 @@ def _save_dual_resolution(fig, out_dir, base_name):
 
 def _compute_series(sim, load_profile, u, Pg, Pch, Pdis, soc):
     T = sim.T
-    losses = np.array([sim.loss(Pg[t, :].reshape(1, -1))[0] for t in range(T)])
+    losses = sim.loss(Pg)
     lhs = Pg.sum(axis=1) + Pdis - Pch
     rhs = load_profile + losses
     balance_residual = lhs - rhs
 
-    reserve_total = np.array(
-        [
-            sim.reserve_gen(Pg[t, :].reshape(1, -1))[0] + sim.reserve_storage(np.array([Pdis[t]]), np.array([soc[t]]))[0]
-            for t in range(T)
-        ]
-    )
+    reserve_total = sim.reserve_gen(Pg) + sim.reserve_storage(Pdis, soc[:T])
     reserve_margin = reserve_total - sim.R
 
     ramp_vio_by_hour = np.zeros(T, dtype=float)
@@ -573,17 +571,24 @@ def _compute_series(sim, load_profile, u, Pg, Pch, Pdis, soc):
     return losses, balance_residual, reserve_total, reserve_margin, ramp_vio_by_hour
 
 
+def _extract_soc_array(soc_value):
+    if isinstance(soc_value, np.ndarray) and soc_value.ndim > 1:
+        return soc_value[0]
+    return np.array(soc_value, dtype=float)
+
+
 def build_unified_result(method_name, sim, load_profile, u, Pg, Pch, Pdis, det, solve_time_sec):
-    soc = det["soc"][0] if isinstance(det["soc"], np.ndarray) and det["soc"].ndim > 1 else np.array(det["soc"], dtype=float)
+    soc = _extract_soc_array(det["soc"])
     _, balance_residual, reserve_total, reserve_margin, ramp_vio_by_hour = _compute_series(
         sim, load_profile, u, Pg, Pch, Pdis, soc
     )
 
-    total_cost = float(det.get("gen_cost", 0.0)) + float(det.get("storage_cost", 0.0)) + float(det.get("su_sd_cost", 0.0))
-    if isinstance(det.get("gen_cost"), np.ndarray):
-        total_cost = float(det["gen_cost"][0] + det["storage_cost"][0] + det["su_sd_cost"][0])
     if "total_cost" in det:
         total_cost = float(det["total_cost"])
+    elif isinstance(det.get("gen_cost"), np.ndarray):
+        total_cost = float(det["gen_cost"][0] + det["storage_cost"][0] + det["su_sd_cost"][0])
+    else:
+        total_cost = float(det.get("gen_cost", 0.0)) + float(det.get("storage_cost", 0.0)) + float(det.get("su_sd_cost", 0.0))
 
     balance_mm = float(np.sum(np.abs(balance_residual)))
     reserve_vio = float(np.sum(np.maximum(0.0, -reserve_margin)))
@@ -621,9 +626,10 @@ def build_unified_result(method_name, sim, load_profile, u, Pg, Pch, Pdis, det, 
 def load_unified_result_json(path):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    for key in ["method", "load_mw", "Pg_mw", "Pch_mw", "Pdis_mw", "soc_mwh", "total_cost_usd", "solve_time_sec"]:
-        if key not in data:
-            raise ValueError(f"Missing key in {path}: {key}")
+    required_keys = ["method", "load_mw", "Pg_mw", "Pch_mw", "Pdis_mw", "soc_mwh", "total_cost_usd", "solve_time_sec"]
+    missing = [k for k in required_keys if k not in data]
+    if missing:
+        raise ValueError(f"Missing keys in {path}: {', '.join(missing)}")
     out = dict(data)
     for k in ["load_mw", "Pg_mw", "Pch_mw", "Pdis_mw", "soc_mwh", "balance_residual_mw", "reserve_margin_mw"]:
         if k in out:
@@ -639,7 +645,7 @@ def load_unified_result_json(path):
     if "reserve_violation_mw" not in out and "reserve_margin_mw" in out:
         out["reserve_violation_mw"] = float(np.sum(np.maximum(0.0, -out["reserve_margin_mw"])))
     if "ramp_violation_mw" not in out:
-        out["ramp_violation_mw"] = float(out.get("ramp_violation_mw", 0.0))
+        out["ramp_violation_mw"] = float(np.sum(out.get("ramp_vio_by_hour_mw", 0.0)))
     return out
 
 
@@ -745,12 +751,16 @@ def generate_comparison_artifacts(method_results, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     _set_plot_style()
     methods = [r["method"] for r in method_results]
-    baseline_idx = methods.index("MILP") if "MILP" in methods else 0
+    if "MILP" in methods:
+        baseline_idx = methods.index("MILP")
+    else:
+        baseline_idx = 0
+        print(f"[WARN] MILP baseline not found, using '{methods[0]}' as comparison baseline.")
     baseline_cost = method_results[baseline_idx]["total_cost_usd"]
     baseline_time = method_results[baseline_idx]["solve_time_sec"] if method_results[baseline_idx]["solve_time_sec"] > 0 else 1.0
-    baseline_balance = max(method_results[baseline_idx].get("balance_mm_mw", 0.0), 1e-12)
-    baseline_reserve = max(method_results[baseline_idx].get("reserve_violation_mw", 0.0), 1e-12)
-    baseline_ramp = max(method_results[baseline_idx].get("ramp_violation_mw", 0.0), 1e-12)
+    baseline_balance = max(method_results[baseline_idx].get("balance_mm_mw", 0.0), MIN_BASELINE_DENOMINATOR)
+    baseline_reserve = max(method_results[baseline_idx].get("reserve_violation_mw", 0.0), MIN_BASELINE_DENOMINATOR)
+    baseline_ramp = max(method_results[baseline_idx].get("ramp_violation_mw", 0.0), MIN_BASELINE_DENOMINATOR)
 
     rows = []
     for r in method_results:
@@ -795,7 +805,7 @@ def generate_comparison_artifacts(method_results, out_dir):
 
     fig = plt.figure(figsize=(11, 6))
     y = np.arange(len(categories))
-    bar_h = 0.75 / max(1, len(methods))
+    bar_h = BAR_HEIGHT_SCALE / max(1, len(methods))
     for i, m in enumerate(methods):
         offset = (i - (len(methods) - 1) / 2) * bar_h
         plt.barh(y + offset, values[i], height=bar_h, label=m)
@@ -845,10 +855,10 @@ def parse_args():
     parser.add_argument("--num-particles", type=int, default=120, help="PSO粒子数")
     parser.add_argument("--max-iter", type=int, default=200, help="PSO迭代次数")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
-    parser.add_argument("--milp-json", type=str, default="", help="MILP统一结果JSON（可选）")
-    parser.add_argument("--dl-json", type=str, default="", help="深度学习统一结果JSON（可选）")
-    parser.add_argument("--rl-json", type=str, default="", help="强化学习统一结果JSON（可选；为空时使用本脚本PSO结果）")
-    parser.add_argument("--out-root", type=str, default="outputs", help="输出根目录")
+    parser.add_argument("--milp-json", type=str, default="", help="Optional MILP unified-result JSON path")
+    parser.add_argument("--dl-json", type=str, default="", help="Optional deep-learning unified-result JSON path")
+    parser.add_argument("--rl-json", type=str, default="", help="Optional RL unified-result JSON path (defaults to current PSO run)")
+    parser.add_argument("--out-root", type=str, default="outputs", help="Output root directory")
     return parser.parse_args()
 
 
