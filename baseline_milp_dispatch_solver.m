@@ -93,7 +93,10 @@ for g = 1:G
     baseOnCost(g) = fg(1);
     for s = 1:nSeg
         segCap(g,s) = bp(s+1)-bp(s);
-        segSlope(g,s) = (fg(s+1)-fg(s))/max(segCap(g,s),1e-9);
+        if segCap(g,s) <= 0
+            error('分段线性化失败：segCap 必须为正，当前 g=%d, s=%d', g, s);
+        end
+        segSlope(g,s) = (fg(s+1)-fg(s))/segCap(g,s);
     end
 end
 
@@ -115,9 +118,6 @@ A = sparse([],[],[],0,nVar,0);
 bvec = [];
 Aeq = sparse([],[],[],0,nVar,0);
 beq = [];
-
-% 工具函数
-addLeq = @(row,rhs) assignin('caller','A',[A; sparse(row)]); %#ok<NASGU>
 
 % 1) 功率上下限 + 分段关系
 for t = 1:T
@@ -328,9 +328,18 @@ end
 
 %% ------------------------ 结果还原与评估 ------------------------
 Pg = reshape(x(idx.Pg), [G,T])';
-u = reshape(round(x(idx.u)), [G,T])';
-y = reshape(round(x(idx.y)), [G,T])';
-z = reshape(round(x(idx.z)), [G,T])';
+uRaw = reshape(x(idx.u), [G,T])';
+yRaw = reshape(x(idx.y), [G,T])';
+zRaw = reshape(x(idx.z), [G,T])';
+intTol = 1e-6;
+if max(abs(uRaw(:) - round(uRaw(:)))) > intTol || ...
+   max(abs(yRaw(:) - round(yRaw(:)))) > intTol || ...
+   max(abs(zRaw(:) - round(zRaw(:)))) > intTol
+    warning('存在接近但非整数的二进制解，已按最近整数处理。');
+end
+u = round(uRaw);
+y = round(yRaw);
+z = round(zRaw);
 Pch = x(idx.Pch(:));
 Pdis = x(idx.Pdis(:));
 E = x(idx.E(:));
