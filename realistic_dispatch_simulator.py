@@ -11,6 +11,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 MIN_BASELINE_DENOMINATOR = 1e-12
+MIN_BASELINE_TIME = 1.0
 BAR_HEIGHT_SCALE = 0.75
 
 
@@ -645,7 +646,7 @@ def load_unified_result_json(path):
     if "reserve_violation_mw" not in out and "reserve_margin_mw" in out:
         out["reserve_violation_mw"] = float(np.sum(np.maximum(0.0, -out["reserve_margin_mw"])))
     if "ramp_violation_mw" not in out:
-        out["ramp_violation_mw"] = float(np.sum(out.get("ramp_vio_by_hour_mw", 0.0)))
+        out["ramp_violation_mw"] = float(np.sum(out.get("ramp_violation_by_hour_mw", 0.0)))
     return out
 
 
@@ -750,6 +751,8 @@ def plot_dispatch_figures(sim, unified_result, hist, out_dir):
 def generate_comparison_artifacts(method_results, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     _set_plot_style()
+    if len(method_results) == 0:
+        raise ValueError("method_results must not be empty.")
     methods = [r["method"] for r in method_results]
     if "MILP" in methods:
         baseline_idx = methods.index("MILP")
@@ -757,7 +760,11 @@ def generate_comparison_artifacts(method_results, out_dir):
         baseline_idx = 0
         print(f"[WARN] MILP baseline not found, using '{methods[0]}' as comparison baseline.")
     baseline_cost = method_results[baseline_idx]["total_cost_usd"]
-    baseline_time = method_results[baseline_idx]["solve_time_sec"] if method_results[baseline_idx]["solve_time_sec"] > 0 else 1.0
+    baseline_time = (
+        method_results[baseline_idx]["solve_time_sec"]
+        if method_results[baseline_idx]["solve_time_sec"] > 0
+        else MIN_BASELINE_TIME
+    )
     baseline_balance = max(method_results[baseline_idx].get("balance_mm_mw", 0.0), MIN_BASELINE_DENOMINATOR)
     baseline_reserve = max(method_results[baseline_idx].get("reserve_violation_mw", 0.0), MIN_BASELINE_DENOMINATOR)
     baseline_ramp = max(method_results[baseline_idx].get("ramp_violation_mw", 0.0), MIN_BASELINE_DENOMINATOR)
@@ -805,7 +812,7 @@ def generate_comparison_artifacts(method_results, out_dir):
 
     fig = plt.figure(figsize=(11, 6))
     y = np.arange(len(categories))
-    bar_h = BAR_HEIGHT_SCALE / max(1, len(methods))
+    bar_h = BAR_HEIGHT_SCALE / len(methods)
     for i, m in enumerate(methods):
         offset = (i - (len(methods) - 1) / 2) * bar_h
         plt.barh(y + offset, values[i], height=bar_h, label=m)
