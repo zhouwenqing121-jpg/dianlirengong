@@ -232,26 +232,27 @@ class RealisticDispatchSimulator:
                 if idx_pos.size > 0:
                     on_pos = u[idx_pos, t, :] == 1
                     headroom = (self.Pmax - P_t[idx_pos]) * on_pos
-                    denom = np.sum(headroom, axis=1, keepdims=True)
-                    valid = denom.squeeze() > 1e-12
+                    row_sum = np.sum(headroom, axis=1)
+                    valid = row_sum > 1e-12
                     if np.any(valid):
                         k = idx_pos[valid]
                         hr = headroom[valid]
-                        share = hr / np.sum(hr, axis=1, keepdims=True)
+                        share = hr / row_sum[valid].reshape(-1, 1)
                         P_t[k] += mismatch[k].reshape(-1, 1) * share
 
                 idx_neg = idx[mismatch[idx] < 0]
                 if idx_neg.size > 0:
                     on_neg = u[idx_neg, t, :] == 1
                     footroom = (P_t[idx_neg] - self.Pmin) * on_neg
-                    denom = np.sum(footroom, axis=1, keepdims=True)
-                    valid = denom.squeeze() > 1e-12
+                    row_sum = np.sum(footroom, axis=1)
+                    valid = row_sum > 1e-12
                     if np.any(valid):
                         k = idx_neg[valid]
                         fr = footroom[valid]
-                        share = fr / np.sum(fr, axis=1, keepdims=True)
+                        share = fr / row_sum[valid].reshape(-1, 1)
                         P_t[k] += mismatch[k].reshape(-1, 1) * share
 
+                P_t = np.nan_to_num(P_t, nan=0.0, posinf=float(np.max(self.Pmax)), neginf=0.0)
                 lo = u[:, t, :] * self.Pmin.reshape(1, -1)
                 hi = u[:, t, :] * self.Pmax.reshape(1, -1)
                 P_t = np.clip(P_t, lo, hi)
