@@ -110,39 +110,43 @@ WIND_OM_PRICE       = 18.0   # 风电运维单价 (元/MWh)
 CURTAILMENT_PRICE   = 300.0  # 弃风惩罚单价 (元/MWh)
 WIND_W2_RATIO       = 0.5    # W2 最大可用容量占 P_WY 的比例
 
-# 惩罚系数按约束重要性分层：
-#   PENALTY_BALANCE(1e8) > PENALTY_RAMP(1e7) > PENALTY_FLOW(1e5)
-# 功率平衡是硬约束（违反会使潮流无解），优先级最高；
-# 爬坡约束影响运行安全，次之；支路越限属于软约束，惩罚较低。
-PENALTY_BALANCE  = 1e8   # 全网功率不平衡惩罚系数（硬约束）
-PENALTY_RAMP     = 1e7   # 爬坡越限惩罚系数（安全约束）
-PENALTY_FLOW     = 1e5   # 支路潮流越限惩罚系数（软约束）
-FLOW_LIMIT       = 600.0 # 支路潮流上限 (MW)
+# 惩罚系数
+# G1 为平衡节点（与MATLAB中的松弛母线对应），由功率平衡方程直接推算；
+# PSO 每步迭代后执行 G2 修复，保证 G1 始终在机组出力范围内，
+# 因此 fitness 中无需对 G1 越界施加惩罚。
+# 爬坡约束和支路越限用惩罚处理。
+PENALTY_RAMP = 1e7   # 爬坡越限惩罚系数
+PENALTY_FLOW = 1e5   # 支路潮流越限惩罚系数（软约束）
+FLOW_LIMIT   = 600.0 # 支路潮流上限 (MW)
 
-# 预计算各时刻的上下界向量（避免循环内重复创建）
-_lb = np.empty(4 * T)
-_ub = np.empty(4 * T)
+# 决策变量布局: [P_G2(0..T-1), P_W1(0..T-1), P_W2(0..T-1)]，共 3*T = 72 个变量。
+# G1 不作为决策变量，而是由每个时刻的功率平衡方程推算：
+#   P_G1[t] = PLoad[t] - P_G2[t] - P_W1[t] - P_W2[t]
+# 这与MATLAB模型中 Bus 1 为松弛母线（取剩余功率）的设定完全一致。
+_lb = np.empty(3 * T)
+_ub = np.empty(3 * T)
 for _t in range(T):
-    _lb[_t]          = P_GMIN[0]
-    _ub[_t]          = P_GMAX[0]
-    _lb[T   + _t]    = P_GMIN[1]
-    _ub[T   + _t]    = P_GMAX[1]
-    _lb[2*T + _t]    = 0.0
-    _ub[2*T + _t]    = P_WY[_t]
-    _lb[3*T + _t]    = 0.0
-    _ub[3*T + _t]    = P_WY[_t] * WIND_W2_RATIO
+    _lb[_t]          = P_GMIN[1]              # P_G2 下限
+    _ub[_t]          = P_GMAX[1]              # P_G2 上限
+    _lb[T   + _t]    = 0.0                    # P_W1 下限
+    _ub[T   + _t]    = P_WY[_t]              # P_W1 上限
+    _lb[2*T + _t]    = 0.0                    # P_W2 下限
+    _ub[2*T + _t]    = P_WY[_t] * WIND_W2_RATIO  # P_W2 上限
 
 
 def fitness(x):
     """
     计算粒子的适应度（目标值 + 惩罚项）。
-    x 布局: [P_G1(0..T-1), P_G2(0..T-1), P_net1(0..T-1), P_net2(0..T-1)]
-    共 4*T = 96 个变量。
+    x 布局: [P_G2(0..T-1), P_W1(0..T-1), P_W2(0..T-1)]，共 3*T = 72 个变量。
+    G1 由功率平衡方程推算（松弛母线），保证全网功率平衡。
+    PSO 每步执行修复，G1 始终在机组出力范围内，此处无需 G1 越界惩罚。
     """
-    P_G1   = x[0:T]
-    P_G2   = x[T:2*T]
-    P_net1 = x[2*T:3*T]
-    P_net2 = x[3*T:4*T]
+    P_G2   = x[0:T]
+    P_net1 = x[T:2*T]
+    P_net2 = x[2*T:3*T]
+
+    # ---- G1 由平衡方程推算（松弛母线）----
+    P_G1 = np.clip(PLoad - P_G2 - P_net1 - P_net2, P_GMIN[0], P_GMAX[0])
 
     # ---- 目标成本 ----
     # 火电燃煤成本
@@ -168,32 +172,97 @@ def fitness(x):
         (ramp_up2**2).sum() + (ramp_down2**2).sum()
     )
 
-    # ---- 惩罚：节点功率平衡 & 支路越限 ----
-    pen_balance = 0.0
-    pen_flow    = 0.0
-
+    # ---- 惩罚：支路越限（DC潮流）----
+    pen_flow = 0.0
     for t in range(T):
-        # 计算各节点净注入 (MW)
         P_inj = -P_Load_Node[:, t].copy()
         P_inj[0]  += P_G1[t]    # G1 在 bus 1 (index 0)
         P_inj[4]  += P_G2[t]    # G2 在 bus 5 (index 4)
         P_inj[7]  += P_net1[t]  # W1 在 bus 8 (index 7)
         P_inj[10] += P_net2[t]  # W2 在 bus 11 (index 10)
 
-        # 全网功率不平衡惩罚
-        bal_err = P_inj.sum()
-        pen_balance += PENALTY_BALANCE * bal_err**2
-
-        # DC潮流与支路越限惩罚
         theta  = solve_dc_pf(P_inj)
         flows  = compute_branch_flows(theta)
         viol   = np.maximum(0.0, np.abs(flows) - FLOW_LIMIT)
         pen_flow += PENALTY_FLOW * (viol**2).sum()
 
-    return obj + pen_ramp + pen_balance + pen_flow
+    return obj + pen_ramp + pen_flow
 
 
 # ================== 6. 粒子群优化 (PSO) ==================
+
+def _repair_feasibility(pos):
+    """
+    修复粒子位置，保证每个时刻功率严格平衡且所有变量在可行域内：
+      G1 = PLoad − G2 − W1 − W2 ∈ [P_GMIN[0], P_GMAX[0]]
+      G2 ∈ [P_GMIN[1], P_GMAX[1]]
+      W1 ∈ [0, P_WY[t]], W2 ∈ [0, P_WY[t]*0.5]
+
+    修复规则（与MATLAB中松弛母线 Bus 1 的物理含义一致）：
+      - G1 偏高 (>30MW)：先增大 G2 吸收，若 G2 已达上限则弃风 (W2→W1)
+      - G1 偏低 (<5MW)：先减小 G2 释放，若 G2 已达下限则弃风 (W2→W1)
+    所有情况下 G1 + G2 + W1 + W2 = PLoad 精确成立。
+
+    pos 形状: (n_particles, 3*T)，列布局 [G2(0..T-1), W1(0..T-1), W2(0..T-1)]。
+    """
+    for t in range(T):
+        g2 = np.clip(pos[:, t],           P_GMIN[1], P_GMAX[1])
+        w1 = np.clip(pos[:, T   + t],     0.0,       P_WY[t])
+        w2 = np.clip(pos[:, 2*T + t],     0.0,       P_WY[t] * WIND_W2_RATIO)
+
+        g1 = PLoad[t] - g2 - w1 - w2
+
+        # ---- G1 超上限：需要增加 G2 或弃风 ----
+        over = np.maximum(0.0, g1 - P_GMAX[0])
+        g2_inc = np.minimum(over, P_GMAX[1] - g2)
+        g2  += g2_inc
+        over -= g2_inc
+        w2_cut = np.minimum(w2, over)
+        w2  -= w2_cut
+        over -= w2_cut
+        w1  -= np.minimum(w1, over)
+
+        # ---- G1 低于下限：需要减少 G2 或弃风 ----
+        g1 = PLoad[t] - g2 - w1 - w2          # 重新计算
+        under = np.maximum(0.0, P_GMIN[0] - g1)
+        g2_dec = np.minimum(under, g2 - P_GMIN[1])
+        g2  -= g2_dec
+        under -= g2_dec
+        w2_cut2 = np.minimum(w2, under)
+        w2  -= w2_cut2
+        under -= w2_cut2
+        w1  -= np.minimum(w1, under)
+
+        pos[:, t]         = g2
+        pos[:, T   + t]   = w1
+        pos[:, 2*T + t]   = w2
+    return pos
+
+
+def _compute_warm_start():
+    """
+    计算热启动初始解：最大化风电利用率，G2 爬坡修复后剩余不平衡由 G1 承担。
+    策略：W1 = P_WY, W2 = P_WY*0.5（满发），G2 取 (PLoad-1.5*P_WY)/2
+          再对 G2 做爬坡修复（前向），最后用 _repair_feasibility 保证 G1 在界。
+    """
+    w1 = P_WY.copy()
+    w2 = P_WY * WIND_W2_RATIO
+    t_req = np.maximum(0.0, PLoad - w1 - w2)          # 所需火电总量
+    g2 = np.clip(t_req / 2.0, P_GMIN[1], P_GMAX[1])  # 两台机均分
+
+    # 前向爬坡修复 G2
+    for t in range(1, T):
+        delta = g2[t] - g2[t - 1]
+        if delta > R_U[1]:
+            g2[t] = g2[t - 1] + R_U[1]
+        elif delta < -R_D[1]:
+            g2[t] = g2[t - 1] - R_D[1]
+        g2[t] = np.clip(g2[t], P_GMIN[1], P_GMAX[1])
+
+    x = np.concatenate([g2, w1, w2]).reshape(1, -1)
+    x = _repair_feasibility(x)                                   # G1 越界时调整 G2
+    return x[0]
+
 
 def pso_dispatch(n_particles=80, max_iter=400, w=0.7298, c1=1.4962, c2=1.4962):
     """
@@ -209,10 +278,22 @@ def pso_dispatch(n_particles=80, max_iter=400, w=0.7298, c1=1.4962, c2=1.4962):
         gbest_val   : 全局最优适应度
         history     : 每代最优适应度记录
     """
-    n_var = 4 * T
+    n_var = 3 * T   # 决策变量: [P_G2, P_W1, P_W2]，G1 由平衡方程推算
 
     # --- 初始化位置与速度 ---
-    pos = _lb + np.random.rand(n_particles, n_var) * (_ub - _lb)
+    # 前 1/4 的粒子在"最大风电热启动解"附近均匀扰动，其余随机初始化，
+    # 以兼顾收敛速度（热启动）与搜索多样性（随机粒子）。
+    x_warm = _compute_warm_start()
+    n_warm = n_particles // 4
+    pos = np.empty((n_particles, n_var))
+    # 热启动粒子：在热启动解周围做小扰动
+    scale = 0.05 * (_ub - _lb)
+    pos[:n_warm] = x_warm + np.random.randn(n_warm, n_var) * scale
+    # 随机粒子
+    pos[n_warm:] = _lb + np.random.rand(n_particles - n_warm, n_var) * (_ub - _lb)
+    pos = np.clip(pos, _lb, _ub)
+    pos = _repair_feasibility(pos)                        # 确保初始粒子 G1 在界
+
     vel_range = 0.1 * (_ub - _lb)
     vel = -vel_range + 2.0 * np.random.rand(n_particles, n_var) * vel_range
 
@@ -240,8 +321,9 @@ def pso_dispatch(n_particles=80, max_iter=400, w=0.7298, c1=1.4962, c2=1.4962):
 
         pos = pos + vel
 
-        # 越界修复：截断到可行域
+        # 越界修复：先截断到各变量可行域，再修复 G2 使 G1 在界
         pos = np.clip(pos, _lb, _ub)
+        pos = _repair_feasibility(pos)
 
         # 评估并更新个体/全局最优
         for i in range(n_particles):
@@ -274,10 +356,11 @@ best_x, best_fitness, cost_history = pso_dispatch(
 )
 
 # 提取最优解
-Val_PG1   = best_x[0:T]
-Val_PG2   = best_x[T:2*T]
-Val_PW1   = best_x[2*T:3*T]
-Val_PW2   = best_x[3*T:4*T]
+Val_PG2   = best_x[0:T]
+Val_PW1   = best_x[T:2*T]
+Val_PW2   = best_x[2*T:3*T]
+# G1 由平衡方程推算（与MATLAB松弛母线一致）
+Val_PG1   = np.clip(PLoad - Val_PG2 - Val_PW1 - Val_PW2, P_GMIN[0], P_GMAX[0])
 
 # 分项成本
 Cost_Coal_Total  = (
