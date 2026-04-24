@@ -105,9 +105,18 @@ def compute_branch_flows(theta):
 
 
 # ================== 5. 适应度函数（目标 + 惩罚） ==================
-PENALTY_BALANCE  = 1e8   # 功率不平衡惩罚系数
-PENALTY_RAMP     = 1e7   # 爬坡越限惩罚系数
-PENALTY_FLOW     = 1e5   # 支路越限惩罚系数
+# 成本系数（与MATLAB保持一致）
+WIND_OM_PRICE       = 18.0   # 风电运维单价 (元/MWh)
+CURTAILMENT_PRICE   = 300.0  # 弃风惩罚单价 (元/MWh)
+WIND_W2_RATIO       = 0.5    # W2 最大可用容量占 P_WY 的比例
+
+# 惩罚系数按约束重要性分层：
+#   PENALTY_BALANCE(1e8) > PENALTY_RAMP(1e7) > PENALTY_FLOW(1e5)
+# 功率平衡是硬约束（违反会使潮流无解），优先级最高；
+# 爬坡约束影响运行安全，次之；支路越限属于软约束，惩罚较低。
+PENALTY_BALANCE  = 1e8   # 全网功率不平衡惩罚系数（硬约束）
+PENALTY_RAMP     = 1e7   # 爬坡越限惩罚系数（安全约束）
+PENALTY_FLOW     = 1e5   # 支路潮流越限惩罚系数（软约束）
 FLOW_LIMIT       = 600.0 # 支路潮流上限 (MW)
 
 # 预计算各时刻的上下界向量（避免循环内重复创建）
@@ -121,7 +130,7 @@ for _t in range(T):
     _lb[2*T + _t]    = 0.0
     _ub[2*T + _t]    = P_WY[_t]
     _lb[3*T + _t]    = 0.0
-    _ub[3*T + _t]    = P_WY[_t] / 2.0
+    _ub[3*T + _t]    = P_WY[_t] * WIND_W2_RATIO
 
 
 def fitness(x):
@@ -142,10 +151,10 @@ def fitness(x):
     Cost_Coal = coal1.sum() + coal2.sum()
 
     # 风电运维成本
-    Cost_OM = 18.0 * (P_net1 + P_net2).sum()
+    Cost_OM = WIND_OM_PRICE * (P_net1 + P_net2).sum()
 
     # 弃风惩罚成本
-    Cost_Curtail = (300.0 * (P_WY - P_net1)).sum() + (300.0 * (P_WY / 2.0 - P_net2)).sum()
+    Cost_Curtail = (CURTAILMENT_PRICE * (P_WY - P_net1)).sum() + (CURTAILMENT_PRICE * (P_WY * WIND_W2_RATIO - P_net2)).sum()
 
     obj = Cost_Coal + Cost_OM + Cost_Curtail
 
@@ -275,10 +284,10 @@ Cost_Coal_Total  = (
     (a[0] * Val_PG1**2 + b_coef[0] * Val_PG1 + c_coef[0]).sum() * coal_price
     + (a[1] * Val_PG2**2 + b_coef[1] * Val_PG2 + c_coef[1]).sum() * coal_price
 )
-Cost_Wind_OM     = 18.0 * (Val_PW1 + Val_PW2).sum()
+Cost_Wind_OM     = WIND_OM_PRICE * (Val_PW1 + Val_PW2).sum()
 Cost_Curtail_Val = (
-    (300.0 * (P_WY - Val_PW1)).sum()
-    + (300.0 * (P_WY / 2.0 - Val_PW2)).sum()
+    (CURTAILMENT_PRICE * (P_WY - Val_PW1)).sum()
+    + (CURTAILMENT_PRICE * (P_WY * WIND_W2_RATIO - Val_PW2)).sum()
 )
 Cost_Total = Cost_Coal_Total + Cost_Wind_OM + Cost_Curtail_Val
 
@@ -292,7 +301,7 @@ print("=" * 55)
 # ================== 8. 结果可视化 ==================
 
 Val_TotalWind_Gen   = Val_PW1 + Val_PW2
-Val_TotalWind_Avail = P_WY + P_WY / 2.0
+Val_TotalWind_Avail = P_WY + P_WY * WIND_W2_RATIO
 t_axis = np.arange(1, T + 1)
 
 # -------- 图1：成本分析 --------
