@@ -139,13 +139,15 @@ def fitness(x):
     计算粒子的适应度（目标值 + 惩罚项）。
     x 布局: [P_G2(0..T-1), P_W1(0..T-1), P_W2(0..T-1)]，共 3*T = 72 个变量。
     G1 由功率平衡方程推算（松弛母线），保证全网功率平衡。
-    PSO 每步执行修复，G1 始终在机组出力范围内，此处无需 G1 越界惩罚。
+    注意：PSO 主循环在每次更新位置后先调用 _repair_feasibility，再调用 fitness，
+    因此 G1 在此处始终处于 [P_GMIN[0], P_GMAX[0]] 范围内；clip 仅作数值安全兜底。
     """
     P_G2   = x[0:T]
     P_net1 = x[T:2*T]
     P_net2 = x[2*T:3*T]
 
     # ---- G1 由平衡方程推算（松弛母线）----
+    # _repair_feasibility 保证 G1 在界，clip 仅为数值安全兜底
     P_G1 = np.clip(PLoad - P_G2 - P_net1 - P_net2, P_GMIN[0], P_GMAX[0])
 
     # ---- 目标成本 ----
@@ -248,7 +250,7 @@ def _compute_warm_start():
     w1 = P_WY.copy()
     w2 = P_WY * WIND_W2_RATIO
     t_req = np.maximum(0.0, PLoad - w1 - w2)          # 所需火电总量
-    g2 = np.clip(t_req / 2.0, P_GMIN[1], P_GMAX[1])  # 两台机均分
+    g2 = np.clip(t_req / 2.0, P_GMIN[1], P_GMAX[1])  # G2 初始估计（均分，G1 由平衡推算）
 
     # 前向爬坡修复 G2
     for t in range(1, T):
@@ -260,7 +262,7 @@ def _compute_warm_start():
         g2[t] = np.clip(g2[t], P_GMIN[1], P_GMAX[1])
 
     x = np.concatenate([g2, w1, w2]).reshape(1, -1)
-    x = _repair_feasibility(x)                                   # G1 越界时调整 G2
+    x = _repair_feasibility(x)    # 调整 G2/弃风，保证 G1 严格在界且功率平衡精确成立
     return x[0]
 
 
@@ -292,7 +294,7 @@ def pso_dispatch(n_particles=80, max_iter=400, w=0.7298, c1=1.4962, c2=1.4962):
     # 随机粒子
     pos[n_warm:] = _lb + np.random.rand(n_particles - n_warm, n_var) * (_ub - _lb)
     pos = np.clip(pos, _lb, _ub)
-    pos = _repair_feasibility(pos)                        # 确保初始粒子 G1 在界
+    pos = _repair_feasibility(pos)  # 保证 G1 在界、功率平衡精确成立
 
     vel_range = 0.1 * (_ub - _lb)
     vel = -vel_range + 2.0 * np.random.rand(n_particles, n_var) * vel_range
